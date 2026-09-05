@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api/sales", tags=["sales-direct"],
                    dependencies=[Depends(require_portal_dep("sales"))])
 
 COLL = "sales_direct_notes"
+RET = "sales_direct_returns"
 WRITE_ROLES = ("superadmin", "admin", "owner", "accounting", "staff_keuangan", "manager_keuangan",
                "sales", "admin_sales", "pic_toko", "cs_staff", "manager_marketing", "admin_gudang")
 TERMS_DAYS = {"cash": 0, "net_7": 7, "net_14": 14, "net_30": 30}
@@ -160,10 +161,10 @@ async def fg_stock(request: Request, q: Optional[str] = None):
 # ── NOTA PENJUALAN LANGSUNG ───────────────────────────────────────────────────
 def _calc(items, tax_pct, discount):
     subtotal = sum(i["amount"] for i in items)
-    tax = round(subtotal * tax_pct / 100)
-    total = round(subtotal + tax - discount)
-    if total < 0:
+    if discount > subtotal:
         raise HTTPException(400, "Diskon melebihi nilai nota.")
+    tax = round((subtotal - discount) * tax_pct / 100)  # PPN atas nilai setelah diskon
+    total = round(subtotal - discount + tax)
     return round(subtotal), tax, total
 
 
@@ -343,7 +344,8 @@ async def confirm_direct_sale(sid: str, request: Request):
         "id": _uid(), "invoice_number": invoice_number, "customer_id": note["customer_id"], "customer_name": note["customer_name"],
         "order_id": None, "issue_date": note["sale_date"], "due_date": note["due_date"],
         "items": [{"description": f"{i['sku']} {i['name']}".strip(), "qty": i["qty"], "unit": "pcs", "price": i["price"], "amount": i["amount"]} for i in note["items"]],
-        "subtotal": note["subtotal"], "tax_pct": note["tax_pct"], "tax_amount": note["tax_amount"], "discount_amount": note["discount_amount"],
+        # Konvensi AR kanonik (post_ar_invoice): `subtotal` = SETELAH diskon; revenue bruto = subtotal + discount_amount
+        "subtotal": note["subtotal"] - note["discount_amount"], "tax_pct": note["tax_pct"], "tax_amount": note["tax_amount"], "discount_amount": note["discount_amount"],
         "total": note["total"], "paid_amount": 0, "balance": note["total"],
         "total_amount": note["total"], "amount_paid": 0, "amount_due": note["total"],
         "status": "issued", "notes": f"Penjualan langsung {note['note_number']}", "sales_channel": "direct",
@@ -443,6 +445,7 @@ async def get_direct_sale(sid: str, request: Request):
     if note.get("ar_invoice_id"):
         note["invoice"] = await db.rahaza_ar_invoices.find_one({"id": note["ar_invoice_id"]}, {"_id": 0})
         note["payments"] = await db.rahaza_cash_movements.find({"ref_id": note["ar_invoice_id"], "category": "ar_payment"}, {"_id": 0}).sort("timestamp", 1).to_list(100)
+    note["returns"] = await db[RET].find({"direct_sale_id": sid}, {"_id": 0}).sort("created_at", -1).to_list(100)
     return serialize_doc(note)
 
 
@@ -495,57 +498,344 @@ async def cash_accounts(request: Request):
     return serialize_doc(rows)
 
 
-# ── CETAK NOTA (PDF) ──────────────────────────────────────────────────────────
+# ── CETAK NOTA (PDF) — mengikuti template PDF pemilik (doc_key `sales-note`) ──
 def _rp(n) -> str:
     return "Rp " + f"{int(round(float(n or 0))):,}".replace(",", ".")
 
 
+def _fmt_d(s):
+    try:
+        dt = datetime.strptime((s or "")[:10], "%Y-%m-%d")
+        return f"{dt.day} {['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agt', 'Sep', 'Okt', 'Nov', 'Des'][dt.month - 1]} {dt.year}"
+    except ValueError:
+        return s or "-"
+
+
+def build_sales_note_pdf(*, note: dict, customer: dict, template: dict, profile: dict, printed_by: str = "") -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import HRFlowable, Paragraph, Spacer, Table, TableStyle
+
+    from core.pdf_template import apply_columns, column_weights, footer_flowables, header_flowables, signature_flowables
+    from data.pdf_doc_registry import columns_of, weights_of
+    from routes.operations_pdf_helpers import CONTENT_W_PORTRAIT, _build_pdf, _pdf_data_table
+
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=9, leading=12, textColor=colors.HexColor("#1f2937"))
+    muted = ParagraphStyle("muted", parent=styles["Normal"], fontSize=8.5, leading=11, textColor=colors.HexColor("#64748b"))
+    right = ParagraphStyle("right", parent=body, alignment=2)
+    avail = CONTENT_W_PORTRAIT
+    status_lbl = {"draft": "DRAFT", "confirmed": "BELUM LUNAS", "paid": "LUNAS", "cancelled": "BATAL"}.get(note.get("status"), (note.get("status") or "").upper())
+    pay_lbl = "TUNAI" if note.get("payment_type") == "cash" else f"TEMPO · JT {_fmt_d(note.get('due_date'))}"
+    elems = header_flowables(template.get("header"), profile, template.get("title") or "NOTA PENJUALAN", avail=avail,
+                             info_pairs=[("No. Nota", note.get("note_number")), ("Tanggal", _fmt_d(note.get("sale_date"))),
+                                         ("No. Invoice", note.get("invoice_number") or "-"), ("Pembayaran", f"{pay_lbl} · {status_lbl}")])
+    bill = (f"<b>Kepada:</b><br/>{customer.get('name') or note.get('customer_name') or '-'}"
+            f"<br/><font size=8 color='#64748b'>{customer.get('address') or ''}<br/>{customer.get('phone') or ''}"
+            f"{(' · ' + customer['email']) if customer.get('email') else ''}{('<br/>NPWP ' + customer['npwp']) if customer.get('npwp') else ''}</font>")
+    elems += [Paragraph(bill, body), Spacer(1, 4 * mm)]
+
+    all_cols = columns_of("sales-note")
+    rows = [[str(i), it.get("sku") or "", it.get("name") or "-", str(it.get("qty") or 0), "pcs", _rp(it.get("price")), _rp(it.get("amount"))]
+            for i, it in enumerate(note.get("items") or [], start=1)]
+    tpl_cols = template.get("columns") or []
+    headers, rows2, keys = apply_columns(tpl_cols, [c["key"] for c in all_cols], [c["label"] for c in all_cols], rows)
+    elems.append(_pdf_data_table(headers, rows2, weights=column_weights(tpl_cols, keys, weights_of("sales-note")),
+                                 right_cols=[i for i, k in enumerate(keys) if k in ("qty", "price", "amount")], style=template.get("table")))
+    elems.append(Spacer(1, 4 * mm))
+
+    totals = [["Subtotal", _rp(note.get("subtotal"))]]
+    if (note.get("tax_amount") or 0) > 0:
+        totals.append([f"PPN ({int(note.get('tax_pct') or 0)}%)", _rp(note.get("tax_amount"))])
+    if (note.get("discount_amount") or 0) > 0:
+        totals.append(["Diskon", "-" + _rp(note.get("discount_amount"))])
+    totals.append(["<b>Total</b>", "<b>" + _rp(note.get("total")) + "</b>"])
+    inv = note.get("invoice") or {}
+    if inv:
+        totals.append(["Sudah Dibayar", _rp(inv.get("paid_amount"))])
+        totals.append(["<b>Sisa Tagihan</b>", "<b>" + _rp(inv.get("balance")) + "</b>"])
+    if note.get("returned_total"):
+        totals.append(["Retur / Nota Kredit", "-" + _rp(note.get("returned_total"))])
+    tt = Table([[Paragraph(k, right), Paragraph(v, right)] for k, v in totals], colWidths=[avail * 0.24, avail * 0.20])
+    tt.setStyle(TableStyle([("LINEABOVE", (0, len(totals) - (3 if inv else 1)), (-1, len(totals) - (3 if inv else 1)), 0.6, colors.HexColor("#94a3b8")),
+                            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f1f5f9")),
+                            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+    wrap = Table([["", tt]], colWidths=[avail * 0.56, avail * 0.44])
+    wrap.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    elems.append(wrap)
+    if note.get("notes"):
+        elems += [Spacer(1, 3 * mm), Paragraph(f"<b>Catatan:</b> {note['notes']}", muted)]
+    elems.extend(signature_flowables(template.get("signatures"), {
+        "customer_name": customer.get("name") or note.get("customer_name") or "", "note_number": note.get("note_number") or "",
+        "invoice_number": note.get("invoice_number") or "", "confirmed_by": note.get("confirmed_by") or note.get("created_by_name") or "",
+        "printed_by": printed_by}, avail=avail))
+    elems += [Spacer(1, 3 * mm), HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#cbd5e1")),
+              Paragraph("Barang yang sudah dibeli dapat diretur sesuai kesepakatan dengan menyertakan nota ini.", muted)]
+    elems.extend(footer_flowables(template.get("footer"), profile))
+    return _build_pdf(io.BytesIO(), elems, page=template.get("page")).getvalue()
+
+
 @router.get("/direct-sales/{sid}/pdf")
 async def direct_sale_pdf(sid: str, request: Request):
-    await require_auth(request)
+    user = await require_auth(request)
     db = get_db()
     note = await db[COLL].find_one({"id": sid}, {"_id": 0})
     if not note:
         raise HTTPException(404, "Nota tidak ditemukan.")
     cust = await db.rahaza_customers.find_one({"id": note["customer_id"]}, {"_id": 0}) or {}
-    from utils.pdf_common import get_company_profile
-    prof = await get_company_profile(db) or {}
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A5, landscape
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A5), leftMargin=10 * mm, rightMargin=10 * mm, topMargin=8 * mm, bottomMargin=8 * mm)
-    st = getSampleStyleSheet()
-    small = st["Normal"].clone("small", fontSize=8, leading=10)
-    el = [Paragraph(f"<b>{prof.get('company_name') or 'CV. DEWI ADITYA'}</b>", st["Title"].clone("t", fontSize=13, leading=15, alignment=0)),
-          Paragraph(" · ".join(x for x in [prof.get("address"), prof.get("phone"), prof.get("email")] if x), small), Spacer(1, 4)]
-    status_lbl = {"draft": "DRAFT", "confirmed": "BELUM LUNAS", "paid": "LUNAS", "cancelled": "BATAL"}.get(note.get("status"), note.get("status", "").upper())
-    head = Table([[Paragraph(f"<b>NOTA PENJUALAN</b><br/>No: {note['note_number']}<br/>Tanggal: {note['sale_date']}<br/>Invoice: {note.get('invoice_number') or '-'}", small),
-                   Paragraph(f"<b>Kepada:</b> {cust.get('name') or note.get('customer_name')}<br/>{cust.get('address') or ''}<br/>{cust.get('phone') or ''}", small),
-                   Paragraph(f"<b>Pembayaran:</b> {'TUNAI' if note['payment_type'] == 'cash' else 'TEMPO'}<br/>Jatuh tempo: {note.get('due_date')}<br/><b>Status: {status_lbl}</b>", small)]],
-                 colWidths=[68 * mm, 68 * mm, 50 * mm])
-    el += [head, Spacer(1, 5)]
-    rows = [["#", "SKU", "Nama Barang", "Qty", "Harga", "Jumlah"]]
-    for i, it in enumerate(note["items"], 1):
-        rows.append([str(i), it["sku"], Paragraph(it.get("name") or "", small), str(it["qty"]), _rp(it["price"]), _rp(it["amount"])])
-    rows.append(["", "", "", "", "Subtotal", _rp(note["subtotal"])])
-    if note.get("tax_amount"):
-        rows.append(["", "", "", "", f"PPN {int(note.get('tax_pct') or 0)}%", _rp(note["tax_amount"])])
-    if note.get("discount_amount"):
-        rows.append(["", "", "", "", "Diskon", f"- {_rp(note['discount_amount'])}"])
-    rows.append(["", "", "", "", "TOTAL", _rp(note["total"])])
-    t = Table(rows, colWidths=[8 * mm, 34 * mm, 70 * mm, 14 * mm, 30 * mm, 30 * mm], repeatRows=1)
-    t.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 8), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e5e7eb")),
-                           ("GRID", (0, 0), (-1, len(note["items"])), 0.4, colors.grey), ("ALIGN", (3, 1), (-1, -1), "RIGHT"),
-                           ("FONTNAME", (4, -1), (-1, -1), "Helvetica-Bold"), ("LINEABOVE", (4, -1), (-1, -1), 0.8, colors.black)]))
-    el += [t, Spacer(1, 6)]
-    if note.get("notes"):
-        el.append(Paragraph(f"Catatan: {note['notes']}", small))
-    el.append(Spacer(1, 10))
-    el.append(Table([[Paragraph("Penerima,<br/><br/><br/>(________________)", small), Paragraph(f"Hormat kami,<br/><br/><br/>({note.get('confirmed_by') or note.get('created_by_name') or '________________'})", small)]],
-                    colWidths=[93 * mm, 93 * mm]))
-    doc.build(el)
-    return Response(content=buf.getvalue(), media_type="application/pdf",
+    if note.get("ar_invoice_id"):
+        note["invoice"] = await db.rahaza_ar_invoices.find_one({"id": note["ar_invoice_id"]}, {"_id": 0, "paid_amount": 1, "balance": 1}) or {}
+    from core import pdf_template
+    template = await pdf_template.resolve(db, "sales-note")
+    profile = await pdf_template.company_profile(db)
+    pdf = build_sales_note_pdf(note=note, customer=cust, template=template, profile=profile, printed_by=user.get("name") or "")
+    return Response(content=pdf, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="Nota_{note["note_number"]}.pdf"'})
+
+
+# ── RETUR PENJUALAN (nota kredit + stok kembali + balik HPP) ──────────────────
+def _ratio_lines(je: Optional[dict]) -> dict:
+    """Proporsi komponen COGS (material/labor/overhead) dari JE COGS asal — utk membalik HPP ke akun yang sama."""
+    out = {}
+    for l in (je or {}).get("lines") or []:
+        if float(l.get("debit") or 0) > 0:
+            out[l["account_code"]] = out.get(l["account_code"], 0) + float(l["debit"])
+    tot = sum(out.values())
+    return {k: v / tot for k, v in out.items()} if tot else {}
+
+
+@router.post("/direct-sales/{sid}/returns")
+async def create_return(sid: str, request: Request):
+    user = await _require_write(request)
+    db = get_db()
+    body = await request.json()
+    note = await db[COLL].find_one({"id": sid}, {"_id": 0})
+    if not note:
+        raise HTTPException(404, "Nota tidak ditemukan.")
+    if note.get("status") not in ("confirmed", "paid"):
+        raise HTTPException(400, "Retur hanya untuk nota yang sudah dikonfirmasi.")
+    raw = body.get("items") or []
+    if not raw:
+        raise HTTPException(400, "Minimal satu item retur.")
+    prev = await db[RET].find({"direct_sale_id": sid, "status": {"$ne": "cancelled"}}, {"_id": 0, "items": 1}).to_list(200)
+    returned = {}
+    for r in prev:
+        for it in r["items"]:
+            returned[it["material_id"]] = returned.get(it["material_id"], 0) + it["qty"]
+    sold = {it["material_id"]: it for it in note["items"]}
+    items = []
+    for idx, ri in enumerate(raw):
+        src = sold.get(ri.get("material_id"))
+        if not src:
+            raise HTTPException(400, f"Item ke-{idx + 1} tidak ada di nota.")
+        qty = int(_num(ri.get("qty"), "qty"))
+        if qty <= 0:
+            raise HTTPException(400, f"Item ke-{idx + 1}: qty harus > 0.")
+        left = src["qty"] - returned.get(src["material_id"], 0)
+        if qty > left:
+            raise HTTPException(400, f"{src['sku']}: maksimal retur {left} pcs (terjual {src['qty']}, sudah diretur {returned.get(src['material_id'], 0)}).")
+        unit_cost = round((float(src.get("fg_cogs") or 0) + float(src.get("fg_cogs_estimated") or 0)) / src["qty"], 2) if src["qty"] else 0
+        items.append({"material_id": src["material_id"], "sku": src["sku"], "name": src.get("name"), "qty": qty, "price": src["price"],
+                      "amount": round(qty * src["price"]), "unit_cost": unit_cost, "cogs": round(unit_cost * qty, 2),
+                      "condition": ri.get("condition") or "good"})
+    factor = (note["subtotal"] - note.get("discount_amount", 0)) / note["subtotal"] if note.get("subtotal") else 1
+    subtotal = round(sum(i["amount"] for i in items) * factor)
+    tax = round(subtotal * float(note.get("tax_pct") or 0) / 100)
+    total = subtotal + tax
+    ret_date = body.get("return_date") or date.today().isoformat()
+    refund_account = body.get("cash_account_id") if body.get("refund_method") == "cash" else None
+    if body.get("refund_method") == "cash" and not refund_account:
+        raise HTTPException(400, "Rekening kas wajib untuk refund tunai.")
+
+    ret_doc = {"id": _uid(), "return_number": await gen_prefixed_number(db, RET, "return_number", f"RT-{ret_date.replace('-', '')}-", 3),
+               "direct_sale_id": sid, "note_number": note["note_number"], "ar_invoice_id": note.get("ar_invoice_id"), "invoice_number": note.get("invoice_number"),
+               "customer_id": note["customer_id"], "customer_name": note.get("customer_name"), "return_date": ret_date,
+               "items": items, "subtotal": subtotal, "tax_pct": note.get("tax_pct") or 0, "tax_amount": tax, "total": total,
+               "cogs_total": round(sum(i["cogs"] for i in items), 2), "reason": body.get("reason") or "", "status": "posted",
+               "created_at": _now(), "updated_at": _now(), "created_by": user["id"], "created_by_name": user.get("name", "")}
+
+    # 1) stok FG kembali + lapisan HPP baru (biaya = HPP saat keluar)
+    from core import fg_cost_layers as fcl
+    from core import stock_service
+    from core.production_qty_ledger import resolve_fg_location_id
+    loc = await resolve_fg_location_id(db)
+    if not loc:
+        raise HTTPException(400, "Lokasi gudang FG (ZNA-FG) tidak ditemukan.")
+    ref = {"type": "sales_return", "id": ret_doc["id"], "return_number": ret_doc["return_number"], "note_number": note["note_number"]}
+    for it in items:
+        if it["condition"] == "damaged":
+            continue  # barang rusak tidak kembali ke stok jual
+        await stock_service.add(it["material_id"], loc, it["qty"], meta={"inventory_category": "fg_internal", "ownership": "cv_da"}, ref=ref, actor=user, db=db)
+        layer = await fcl.push_layer(db, material_id=it["material_id"], qty=it["qty"], po_item={"sku": it["sku"]}, ref=ref, actor=user,
+                                     unit_cost=it["unit_cost"], breakdown={"source": "sales_return", "unit_cost": it["unit_cost"]})
+        it["layer_id"] = (layer or {}).get("id")
+
+    # 2) nota kredit: Dr Retur Penjualan (+ Dr PPN keluaran) / Cr Piutang pelanggan
+    from routes.rahaza_posting import _ar_account_for_invoice, _create_posted_je
+    from routes.rahaza_posting_profiles import get_mapping
+    cn = {"id": _uid(), "cn_number": await gen_prefixed_number(db, "rahaza_credit_notes", "cn_number", f"CN-{ret_date.replace('-', '')}-", 3),
+          "return_id": ret_doc["id"], "direct_sale_id": sid, "ar_invoice_id": note.get("ar_invoice_id"), "customer_id": note["customer_id"],
+          "customer_name": note.get("customer_name"), "platform": "direct", "sales_channel": "direct", "issue_date": ret_date,
+          "items": [{"description": f"Retur {i['sku']} {i['name'] or ''}".strip(), "qty": i["qty"], "unit": "pcs", "price": i["price"], "amount": i["amount"]} for i in items],
+          "subtotal": subtotal, "tax_pct": note.get("tax_pct") or 0, "tax_amount": tax, "total": total, "status": "issued",
+          "notes": f"Retur {ret_doc['return_number']} atas nota {note['note_number']}: {ret_doc['reason']}", "created_at": _now(), "updated_at": _now(),
+          "created_by": user.get("email", "")}
+    await db.rahaza_credit_notes.insert_one(cn)
+    cn.pop("_id", None)
+    inv = await db.rahaza_ar_invoices.find_one({"id": note.get("ar_invoice_id")}, {"_id": 0}) or {}
+    m_cn, m_ar = await get_mapping(db, "credit_note"), await get_mapping(db, "ar_invoice")
+    ar_code = await _ar_account_for_invoice(db, inv, m_cn.get("credit_ar") or m_ar.get("debit_ar"))
+    rev_code, tax_code = m_cn.get("debit_revenue") or m_ar.get("credit_revenue"), m_ar.get("credit_tax_output")
+    cn_post = {"ok": False, "error": "Mapping credit_note/ar_invoice belum lengkap."}
+    if ar_code and rev_code and total > 0:
+        lines = [{"account_code": rev_code, "debit": subtotal, "credit": 0, "description": f"CN {cn['cn_number']} retur {note['note_number']}"}]
+        if tax > 0 and tax_code:
+            lines.append({"account_code": tax_code, "debit": tax, "credit": 0, "description": f"CN {cn['cn_number']} PPN keluaran dibalik"})
+        elif tax > 0:
+            lines[0]["debit"] = total
+        lines.append({"account_code": ar_code, "debit": 0, "credit": total, "description": f"CN {cn['cn_number']} piutang {note.get('customer_name')}"})
+        cn_post = await _create_posted_je(db, date.fromisoformat(ret_date), f"Credit Note {cn['cn_number']} - retur {note['note_number']}", "credit_note", f"cn:{cn['id']}", lines, user)
+        await db.rahaza_credit_notes.update_one({"id": cn["id"]}, {"$set": {"gl_je_id": cn_post.get("je_id"), "gl_je_number": cn_post.get("je_number"), "gl_posted_at": _now(), "post_error": cn_post.get("error")}})
+
+    # 3) terapkan ke invoice: kurangi sisa tagihan; kelebihan = kredit pelanggan (refund tunai bila diminta)
+    applied, refund_amount, refund_je, refund_mv = 0.0, 0.0, None, None
+    if inv:
+        applied = min(total, float(inv.get("balance") or 0))
+        excess = round(total - applied)
+        new_bal = round(float(inv.get("balance") or 0) - applied)
+        upd = {"balance": new_bal, "amount_due": new_bal, "credited_amount": round(float(inv.get("credited_amount") or 0) + total), "updated_at": _now()}
+        if new_bal <= 0 and inv.get("status") not in ("paid", "cancelled"):
+            upd["status"] = "paid"
+        await db.rahaza_ar_invoices.update_one({"id": inv["id"]}, {"$set": upd})
+        if excess > 0:
+            if refund_account:
+                acc = await db.rahaza_cash_accounts.find_one({"id": refund_account}, {"_id": 0})
+                if not acc:
+                    raise HTTPException(404, "Rekening kas refund tidak ditemukan.")
+                refund_mv = _uid()
+                await db.rahaza_cash_movements.insert_one({"id": refund_mv, "account_id": refund_account, "account_name": acc.get("name"), "direction": "out",
+                                                           "amount": excess, "category": "sales_refund", "ref_id": inv["id"], "ref_label": cn["cn_number"], "date": ret_date,
+                                                           "notes": f"Refund retur {ret_doc['return_number']}", "timestamp": _now(), "created_by": user["id"], "created_by_name": user.get("name", "")})
+                await db.rahaza_cash_accounts.update_one({"id": refund_account}, {"$inc": {"balance": -excess}})
+                cash_code = acc.get("gl_account_code") or (await get_mapping(db, "ar_payment")).get("debit_cash")
+                if cash_code and ar_code:
+                    refund_je = await _create_posted_je(db, date.fromisoformat(ret_date), f"Refund retur {ret_doc['return_number']} ke {note.get('customer_name')}", "sales_refund",
+                                                        f"refund:{ret_doc['id']}", [{"account_code": ar_code, "debit": excess, "credit": 0, "description": f"Refund {cn['cn_number']}"},
+                                                                                     {"account_code": cash_code, "debit": 0, "credit": excess, "description": f"Refund {cn['cn_number']}"}], user)
+                refund_amount = excess
+            else:
+                ret_doc["customer_credit"] = excess  # saldo kredit pelanggan (belum dikembalikan)
+
+    # 4) balik HPP: Dr 1-1404 / Cr akun COGS asal (proporsional)
+    cogs_post = None
+    if ret_doc["cogs_total"] > 0:
+        m_cogs = await get_mapping(db, "cogs_shipment")
+        orig = await db.rahaza_journal_entries.find_one({"id": note.get("cogs_je_id")}, {"_id": 0, "lines": 1}) if note.get("cogs_je_id") else None
+        ratio = _ratio_lines(orig) or {m_cogs.get("debit_cogs_material"): 1.0}
+        lines = [{"account_code": m_cogs.get("credit_fg_inventory") or "1-1404", "debit": ret_doc["cogs_total"], "credit": 0, "description": f"Retur {ret_doc['return_number']} FG kembali"}]
+        acc_amt = 0.0
+        codes = list(ratio.items())
+        for i, (code, r) in enumerate(codes):
+            amt = round(ret_doc["cogs_total"] - acc_amt, 2) if i == len(codes) - 1 else round(ret_doc["cogs_total"] * r, 2)
+            acc_amt += amt
+            if amt > 0:
+                lines.append({"account_code": code, "debit": 0, "credit": amt, "description": f"Retur {ret_doc['return_number']} balik HPP"})
+        cogs_post = await _create_posted_je(db, date.fromisoformat(ret_date), f"Balik HPP retur {ret_doc['return_number']} ({note['note_number']})", "cogs_sales_return",
+                                            f"cogs_return:{ret_doc['id']}", lines, user)
+
+    ret_doc.update({"cn_id": cn["id"], "cn_number": cn["cn_number"], "cn_je_id": cn_post.get("je_id"), "cn_je_number": cn_post.get("je_number"), "cn_post_error": cn_post.get("error"),
+                    "applied_to_invoice": round(applied), "refund_amount": refund_amount, "refund_cash_account_id": refund_account if refund_amount else None,
+                    "refund_movement_id": refund_mv, "refund_je_id": (refund_je or {}).get("je_id"),
+                    "cogs_je_id": (cogs_post or {}).get("je_id"), "cogs_je_number": (cogs_post or {}).get("je_number"), "cogs_post_error": (cogs_post or {}).get("error")})
+    await db[RET].insert_one(ret_doc)
+    ret_doc.pop("_id", None)
+    await db[COLL].update_one({"id": sid}, {"$inc": {"returned_total": total, "returned_qty": sum(i["qty"] for i in items)}, "$set": {"updated_at": _now()}})
+    await log_activity(user["id"], user.get("name", ""), "return", "sales.direct", ret_doc["return_number"])
+    return serialize_doc(ret_doc)
+
+
+@router.get("/returns")
+async def list_returns(request: Request, direct_sale_id: Optional[str] = None, limit: int = 300):
+    await require_auth(request)
+    db = get_db()
+    q = {"direct_sale_id": direct_sale_id} if direct_sale_id else {}
+    return serialize_doc(await db[RET].find(q, {"_id": 0}).sort("created_at", -1).to_list(min(limit, 1000)))
+
+
+# ── LAPORAN PENJUALAN ─────────────────────────────────────────────────────────
+@router.get("/report")
+async def sales_report(request: Request, group_by: str = "customer", date_from: Optional[str] = None, date_to: Optional[str] = None, format: Optional[str] = None):
+    await require_auth(request)
+    if group_by not in ("customer", "sku", "day", "month"):
+        raise HTTPException(400, "group_by harus customer|sku|day|month.")
+    db = get_db()
+    q = {"status": {"$in": ["confirmed", "paid"]}}
+    if date_from or date_to:
+        q["sale_date"] = {k: v for k, v in (("$gte", date_from), ("$lte", date_to)) if v}
+    notes = await db[COLL].find(q, {"_id": 0}).to_list(20000)
+    rq = {"status": {"$ne": "cancelled"}}
+    if date_from or date_to:
+        rq["return_date"] = {k: v for k, v in (("$gte", date_from), ("$lte", date_to)) if v}
+    rets = await db[RET].find(rq, {"_id": 0}).to_list(20000)
+    factor = {n["id"]: ((n["subtotal"] - n.get("discount_amount", 0)) / n["subtotal"] if n.get("subtotal") else 1) for n in notes}
+    agg = {}
+
+    def bucket(key, label):
+        return agg.setdefault(key, {"key": key, "label": label, "notes": 0, "qty": 0, "gross": 0.0, "discount": 0.0, "tax": 0.0, "net_sales": 0.0,
+                                    "cogs": 0.0, "returns": 0.0, "return_qty": 0, "margin": 0.0, "note_ids": set()})
+
+    def key_of(n, it=None):
+        if group_by == "customer":
+            return n["customer_id"], f"{n.get('customer_code') or ''} {n.get('customer_name') or ''}".strip()
+        if group_by == "sku":
+            return it["material_id"], f"{it['sku']} · {it.get('name') or ''}"
+        d = n["sale_date"] if group_by == "day" else n["sale_date"][:7]
+        return d, d
+
+    for n in notes:
+        for it in n["items"]:
+            k, lbl = key_of(n, it)
+            b = bucket(k, lbl)
+            b["qty"] += it["qty"]
+            b["gross"] += it["amount"]
+            b["discount"] += it["amount"] * (1 - factor[n["id"]])
+            b["net_sales"] += it["amount"] * factor[n["id"]]
+            b["tax"] += it["amount"] * factor[n["id"]] * float(n.get("tax_pct") or 0) / 100
+            b["cogs"] += float(it.get("fg_cogs") or 0) + float(it.get("fg_cogs_estimated") or 0)
+            b["note_ids"].add(n["id"])
+    note_map = {n["id"]: n for n in notes}
+    for r in rets:
+        n = note_map.get(r["direct_sale_id"]) or {"customer_id": r["customer_id"], "customer_name": r.get("customer_name"), "sale_date": r["return_date"]}
+        ret_items_gross = sum(i["amount"] for i in r["items"]) or 1
+        for it in r["items"]:
+            k, lbl = key_of({**n, "sale_date": r["return_date"] if group_by in ("day", "month") else n.get("sale_date", "")}, it)
+            b = bucket(k, lbl)
+            b["returns"] += float(r.get("subtotal") or 0) * it["amount"] / ret_items_gross
+            b["return_qty"] += it["qty"]
+            b["cogs"] -= float(it.get("cogs") or 0)
+    rows = []
+    for b in agg.values():
+        b["notes"] = len(b.pop("note_ids"))
+        b["net_sales"] = round(b["net_sales"] - b["returns"], 2)
+        b["margin"] = round(b["net_sales"] - b["cogs"], 2)
+        b["margin_pct"] = round(b["margin"] / b["net_sales"] * 100, 1) if b["net_sales"] else 0
+        for k in ("gross", "discount", "tax", "cogs", "returns"):
+            b[k] = round(b[k], 2)
+        rows.append(b)
+    rows.sort(key=lambda r: (r["key"] if group_by in ("day", "month") else -r["net_sales"]))
+    totals = {k: round(sum(r[k] for r in rows), 2) for k in ("qty", "gross", "discount", "tax", "net_sales", "cogs", "returns", "return_qty", "margin")}
+    totals["notes"] = len(notes)
+    totals["margin_pct"] = round(totals["margin"] / totals["net_sales"] * 100, 1) if totals["net_sales"] else 0
+    if format == "csv":
+        import csv
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        hdr = {"customer": "Pelanggan", "sku": "SKU", "day": "Tanggal", "month": "Bulan"}[group_by]
+        w.writerow([hdr, "Nota", "Qty", "Bruto", "Diskon", "PPN", "Retur", "Penjualan Bersih", "HPP", "Laba Kotor", "Margin %", "Qty Retur"])
+        for r in rows:
+            w.writerow([r["label"], r["notes"], r["qty"], r["gross"], r["discount"], r["tax"], r["returns"], r["net_sales"], r["cogs"], r["margin"], r["margin_pct"], r["return_qty"]])
+        w.writerow(["TOTAL", totals["notes"], totals["qty"], totals["gross"], totals["discount"], totals["tax"], totals["returns"], totals["net_sales"], totals["cogs"], totals["margin"], totals["margin_pct"], totals["return_qty"]])
+        return Response(content="\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="laporan_penjualan_{group_by}_{date_from or "awal"}_{date_to or "kini"}.csv"'})
+    return {"group_by": group_by, "date_from": date_from, "date_to": date_to, "rows": rows, "totals": totals}

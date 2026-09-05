@@ -74,6 +74,15 @@ PDF_COLUMN_DEFINITIONS: dict[str, list[dict]] = {
         {'key': 'price', 'label': 'Harga Satuan'},
         {'key': 'amount', 'label': 'Jumlah'},
     ],
+    'sales-note': [
+        {'key': 'no', 'label': 'No', 'required': True},
+        {'key': 'sku', 'label': 'SKU'},
+        {'key': 'description', 'label': 'Nama Barang', 'required': True},
+        {'key': 'qty', 'label': 'Qty', 'required': True},
+        {'key': 'unit', 'label': 'Satuan'},
+        {'key': 'price', 'label': 'Harga'},
+        {'key': 'amount', 'label': 'Jumlah', 'required': True},
+    ],
     'picklist': [
         {'key': 'no', 'label': 'No', 'required': True},
         {'key': 'position_barcode', 'label': 'Barcode Posisi'},
@@ -277,6 +286,7 @@ DEFAULT_COLUMN_WEIGHTS: dict[str, dict] = {'delivery-note': {'no': 0.6, 'materia
     'delivery-note-recap': {'no': 0.6, 'sj_number': 1.8, 'source': 0.9, 'type': 1.2, 'date': 0.9, 'destination': 2.0, 'reference': 1.5, 'status': 1.0, 'lines': 0.6, 'qty': 0.9},
     'payslip': {'no': 0.6, 'component': 2.4, 'type': 1.0, 'note': 2.2, 'amount': 1.3},
     'invoice-maklon': {'no': 0.6, 'description': 3.0, 'sku': 1.2, 'qty': 0.7, 'unit': 0.7, 'price': 1.3, 'amount': 1.4},
+    'sales-note': {'no': 0.6, 'sku': 1.4, 'description': 3.0, 'qty': 0.7, 'unit': 0.7, 'price': 1.3, 'amount': 1.4},
     'picklist': {'no': 0.6, 'position_barcode': 1.5, 'location': 1.4, 'material_code': 1.3, 'material_name': 2.8, 'qty': 0.8, 'unit': 0.7, 'checkbox': 0.7},
     'production-guide': {'no': 0.6, 'step': 1.0, 'description': 3.4, 'standard': 2.0},
     'production-po': {'no': 0.6, 'serial': 1.4, 'product': 2.6, 'sku': 1.4, 'size': 0.7, 'color': 1.0, 'qty': 0.8, 'price': 1.3, 'cmt': 1.3},
@@ -387,6 +397,25 @@ SUPPORTED_PDF_DOCS: dict[str, dict] = {
         "default_signatures": [
             {"subject": "Hormat kami", "name_source": "custom", "custom_name": "",
              "field_key": "", "note": "Finance"},
+        ],
+    },
+    "sales-note": {
+        "label": "Nota Penjualan Langsung",
+        "group": "Keuangan",
+        "page": "portrait",
+        "title": "NOTA PENJUALAN",
+        "available_fields": [
+            {"key": "customer_name", "label": "Nama Pelanggan"},
+            {"key": "note_number", "label": "No. Nota"},
+            {"key": "invoice_number", "label": "No. Invoice"},
+            {"key": "confirmed_by", "label": "Petugas yang mengonfirmasi"},
+            {"key": "printed_by", "label": "Pencetak"},
+        ],
+        "default_signatures": [
+            {"subject": "Penerima", "name_source": "field", "custom_name": "",
+             "field_key": "customer_name", "note": "Pelanggan"},
+            {"subject": "Hormat kami", "name_source": "field", "custom_name": "",
+             "field_key": "confirmed_by", "note": "Penjualan"},
         ],
     },
     "vendor-shipment": {
@@ -542,6 +571,7 @@ COLUMNS_ENFORCED: dict[str, str] = {
     "delivery-note-recap": "backend/routes/wms_delivery_notes.py",
     "picklist": "backend/routes/wms_picklist.py",
     "invoice-maklon": "backend/utils/invoice_pdf.py",
+    "sales-note": "backend/routes/sales_direct.py",
     "production-po": "backend/routes/operations_pdf.py",
     "vendor-shipment": "backend/routes/operations_pdf.py",
     "buyer-shipment-dispatch": "backend/routes/operations_pdf.py",
@@ -722,6 +752,9 @@ def sample_info(doc_key: str) -> list[tuple]:
     elif doc_key == "invoice-maklon":
         base = [("No. Invoice", "INV-MKL-2026-0007"), ("Klien", "PT Aruna Activewear"),
                 ("Tanggal", "17/08/2026"), ("Jatuh Tempo", "31/08/2026")]
+    elif doc_key == "sales-note":
+        base = [("No. Nota", "SL-20260817-001"), ("Pelanggan", "Toko Berkah Jaya"),
+                ("Tanggal", "17/08/2026"), ("Pembayaran", "TUNAI · LUNAS")]
     elif doc_key in ("delivery-note", "vendor-shipment", "buyer-shipment-dispatch"):
         base = [("No. Surat Jalan", sample_value("sj_number", 1)), ("Tanggal", "17/08/2026"),
                 ("Tujuan", "CV Jahit Mitra CMT"), ("No. Kendaraan", "B 9021 XYZ")]
@@ -743,6 +776,7 @@ def sample_context(doc_key: str) -> dict:
         "shipment_number": "SHP-202608-0001", "po_number": "PO-INT-202608-0001",
         "assignee_name": "Budi Santoso", "ref_number": "PL-202608-0007",
         "printed_by": "Admin Gudang",
+        "customer_name": "Toko Berkah Jaya", "note_number": "SL-20260817-001", "confirmed_by": "Admin Penjualan",
     }
 
 

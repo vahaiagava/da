@@ -818,6 +818,7 @@ export const PORTAL_NAV = {
         items: [
           { id: 'sales-dashboard', label: 'Dashboard Penjualan', icon: LineChart },
           { id: 'sales-direct',    label: 'Nota Penjualan',      icon: ReceiptText },
+          { id: 'sales-report',    label: 'Laporan Penjualan',   icon: FileSpreadsheet },
           { id: 'sales-customers', label: 'Master Pelanggan',    icon: Contact },
         ],
       },

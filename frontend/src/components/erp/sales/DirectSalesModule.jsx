@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ReceiptText, Plus, RefreshCw, Trash2, Printer, CheckCircle2, Eye, Wallet, XCircle, AlertTriangle } from 'lucide-react';
+import { ReceiptText, Plus, RefreshCw, Trash2, Printer, CheckCircle2, Eye, Wallet, XCircle, AlertTriangle, Undo2 } from 'lucide-react';
 import { GlassCard, GlassInput } from '@/components/ui/glass';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -92,9 +92,10 @@ function CreateSaleModal({ onClose, onSaved }) {
     if (k === 'material_id') { const s = stock.find(x => x.material_id === v); n.price = s?.default_price || n.price || 0; }
     return n;
   }));
-  const subtotal = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
-  const tax = Math.round(subtotal * (Number(f.tax_pct) || 0) / 100);
-  const total = subtotal + tax - (Number(f.discount_amount) || 0);
+    const subtotal = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
+  const disc = Number(f.discount_amount) || 0;
+  const tax = Math.round((subtotal - disc) * (Number(f.tax_pct) || 0) / 100);
+  const total = subtotal - disc + tax;
   const cust = customers.find(c => c.id === f.customer_id);
 
   const submit = async () => {
@@ -159,14 +160,24 @@ function CreateSaleModal({ onClose, onSaved }) {
 function SaleDetailModal({ note, onClose, onChanged }) {
   const [busy, setBusy] = useState(false);
   const [pay, setPay] = useState(null);
+  const [ret, setRet] = useState(null);
   const [accounts, setAccounts] = useState([]);
   useEffect(() => { apiGet('/sales/cash-accounts').then(setAccounts).catch(() => {}); }, []);
   const inv = note.invoice;
   const balance = inv ? Number(inv.balance || 0) : 0;
+  const returnedQty = (mid) => (note.returns || []).reduce((s, r) => s + r.items.filter(i => i.material_id === mid).reduce((a, i) => a + i.qty, 0), 0);
+  const canReturn = ['confirmed', 'paid'].includes(note.status) && note.items.some(it => it.qty - returnedQty(it.material_id) > 0);
   const act = async (fn, ok) => { setBusy(true); try { const n = await fn(); toast.success(ok); onChanged(n.note || n); } catch (e) { toast.error(e.message); } finally { setBusy(false); } };
   const confirm = () => window.confirm(`Konfirmasi ${note.note_number}? Stok FG akan dikurangi dan jurnal dibuat.`) && act(() => apiPost(`/sales/direct-sales/${note.id}/confirm`, {}), 'Nota dikonfirmasi');
   const cancel = () => window.confirm('Batalkan draft ini?') && act(() => apiPost(`/sales/direct-sales/${note.id}/cancel`, {}), 'Draft dibatalkan');
   const doPay = () => act(async () => { await apiPost(`/sales/direct-sales/${note.id}/payment`, pay); setPay(null); return apiGet(`/sales/direct-sales/${note.id}`); }, 'Pembayaran dicatat');
+  const openReturn = () => setRet({ items: note.items.map(it => ({ material_id: it.material_id, sku: it.sku, max: it.qty - returnedQty(it.material_id), qty: 0, condition: 'good' })), reason: '', refund_method: balance > 0 ? 'credit' : 'cash', cash_account_id: accounts[0]?.id || '' });
+  const doReturn = () => {
+    const items = ret.items.filter(i => Number(i.qty) > 0).map(i => ({ material_id: i.material_id, qty: Number(i.qty), condition: i.condition }));
+    if (!items.length) return toast.error('Isi qty retur minimal satu item.');
+    if (!window.confirm('Proses retur? Stok kembali, nota kredit & jurnal balik dibuat.')) return;
+    act(async () => { const r = await apiPost(`/sales/direct-sales/${note.id}/returns`, { ...ret, items }); setRet(null); toast.info(`Nota kredit ${r.cn_number}${r.refund_amount ? ` · refund Rp ${fmt(r.refund_amount)}` : ''}${r.customer_credit ? ` · saldo kredit pelanggan Rp ${fmt(r.customer_credit)}` : ''}`); return apiGet(`/sales/direct-sales/${note.id}`); }, 'Retur diproses');
+  };
   const gl = useMemo(() => [
     inv?.gl_je_number && `Invoice: ${inv.gl_je_number}`, note.cogs_je_number && `HPP: ${note.cogs_je_number}`,
     note.cogs_post_error && `HPP gagal: ${note.cogs_post_error}`, note.ar_post_error && `Invoice gagal: ${note.ar_post_error}`, note.payment_error && `Kas gagal: ${note.payment_error}`,
@@ -184,6 +195,7 @@ function SaleDetailModal({ note, onClose, onChanged }) {
             {note.status === 'draft' && <Button size="sm" variant="ghost" onClick={cancel} disabled={busy} data-testid="sale-detail-cancel"><XCircle className="w-3.5 h-3.5 mr-1 text-red-400" />Batalkan</Button>}
             {note.status === 'draft' && <Button size="sm" onClick={confirm} disabled={busy} data-testid="sale-detail-confirm"><CheckCircle2 className="w-3.5 h-3.5 mr-1" />Konfirmasi</Button>}
             {note.status === 'confirmed' && balance > 0 && <Button size="sm" onClick={() => setPay({ amount: balance, cash_account_id: accounts[0]?.id || '', date: today() })} disabled={busy} data-testid="sale-detail-pay"><Wallet className="w-3.5 h-3.5 mr-1" />Terima Pembayaran</Button>}
+            {canReturn && <Button size="sm" variant="ghost" onClick={openReturn} disabled={busy} data-testid="sale-detail-return"><Undo2 className="w-3.5 h-3.5 mr-1 text-amber-400" />Retur</Button>}
           </div>
         </div>
         <table className="w-full text-xs" data-testid="sale-detail-items"><thead className="bg-foreground/5 text-muted-foreground"><tr><th className="text-left px-2 py-1">SKU</th><th className="text-right px-2">Qty</th><th className="text-right px-2">Harga</th><th className="text-right px-2">Jumlah</th><th className="text-right px-2">HPP FIFO</th></tr></thead>
@@ -205,6 +217,38 @@ function SaleDetailModal({ note, onClose, onChanged }) {
             <Button size="sm" onClick={doPay} disabled={busy} data-testid="sale-pay-submit">Simpan Pembayaran</Button>
             <Button size="sm" variant="ghost" onClick={() => setPay(null)}>Batal</Button>
           </GlassCard>
+        )}
+        {ret && (
+          <GlassCard className="p-3 space-y-2" data-testid="sale-return-form">
+            <div className="text-xs font-semibold">Retur Penjualan — pilih qty per item</div>
+            <table className="w-full text-xs"><thead className="text-muted-foreground"><tr><th className="text-left py-1">SKU</th><th className="text-right">Bisa diretur</th><th className="w-24">Qty Retur</th><th className="w-44">Kondisi</th></tr></thead>
+              <tbody>{ret.items.map((it, i) => (
+                <tr key={it.material_id} className="border-t border-foreground/5"><td className="py-1 font-mono">{it.sku}</td><td className="text-right">{it.max}</td>
+                  <td><GlassInput type="number" min="0" max={it.max} value={it.qty} disabled={it.max <= 0} onChange={e => setRet(r => ({ ...r, items: r.items.map((x, idx) => idx === i ? { ...x, qty: e.target.value } : x) }))} className="h-8" data-testid={`sale-return-qty-${i}`} /></td>
+                  <td><select className={`${sel} h-8`} value={it.condition} onChange={e => setRet(r => ({ ...r, items: r.items.map((x, idx) => idx === i ? { ...x, condition: e.target.value } : x) }))} data-testid={`sale-return-cond-${i}`}><option value="good">Baik (kembali ke stok)</option><option value="damaged">Rusak (tidak ke stok)</option></select></td></tr>
+              ))}</tbody></table>
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="space-y-1 flex-1 min-w-[180px]"><span className="text-xs text-muted-foreground">Alasan</span><GlassInput value={ret.reason} onChange={e => setRet(r => ({ ...r, reason: e.target.value }))} className="h-8" data-testid="sale-return-reason" /></label>
+              <label className="space-y-1"><span className="text-xs text-muted-foreground">Kelebihan kredit</span>
+                <select className={`${sel} h-8`} value={ret.refund_method} onChange={e => setRet(r => ({ ...r, refund_method: e.target.value }))} data-testid="sale-return-refund"><option value="credit">Potong tagihan / simpan sbg kredit pelanggan</option><option value="cash">Refund tunai dari kas</option></select></label>
+              {ret.refund_method === 'cash' && <label className="space-y-1"><span className="text-xs text-muted-foreground">Kas/Bank</span><select className={`${sel} h-8`} value={ret.cash_account_id} onChange={e => setRet(r => ({ ...r, cash_account_id: e.target.value }))} data-testid="sale-return-account">{accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>}
+              <Button size="sm" onClick={doReturn} disabled={busy} data-testid="sale-return-submit">Proses Retur</Button>
+              <Button size="sm" variant="ghost" onClick={() => setRet(null)}>Batal</Button>
+            </div>
+          </GlassCard>
+        )}
+        {note.returns?.length > 0 && (
+          <div className="space-y-1" data-testid="sale-returns-list">
+            <div className="text-xs font-semibold">Riwayat Retur</div>
+            {note.returns.map(r => (
+              <div key={r.id} className="text-xs flex flex-wrap gap-x-3 border-t border-foreground/5 py-1" data-testid={`sale-return-row-${r.return_number}`}>
+                <span className="font-mono">{r.return_number}</span><span>{r.return_date}</span><span>{r.items.map(i => `${i.sku} ×${i.qty}`).join(', ')}</span>
+                <span className="font-semibold">Kredit Rp {fmt(r.total)}</span><span className="text-muted-foreground">CN {r.cn_number}{r.cn_je_number ? ` · ${r.cn_je_number}` : ''}{r.cogs_je_number ? ` · HPP ${r.cogs_je_number}` : ''}</span>
+                {r.refund_amount > 0 && <span className="text-emerald-300">refund Rp {fmt(r.refund_amount)}</span>}{r.customer_credit > 0 && <span className="text-amber-300">kredit pelanggan Rp {fmt(r.customer_credit)}</span>}
+                {r.reason && <span className="text-muted-foreground">“{r.reason}”</span>}
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </Modal>

@@ -544,6 +544,7 @@ const SupplierMasterModule       = lazy(() => import('./procurement/SupplierMast
 const SalesDashboardModule       = lazy(() => import('./sales/SalesDashboardModule'));
 const SalesCustomersModule       = lazy(() => import('./sales/SalesCustomersModule'));
 const DirectSalesModule          = lazy(() => import('./sales/DirectSalesModule'));
+const SalesReportModule          = lazy(() => import('./sales/SalesReportModule'));
 const ProcurementSpendModule     = lazy(() => import('./procurement/ProcurementSpendModule'));
 const SupplierInvoiceModule      = lazy(() => import('./procurement/SupplierInvoiceModule'));
 
@@ -932,6 +933,7 @@ export const MODULE_REGISTRY = {
   'sales-dashboard':       SalesDashboardModule,
   'sales-customers':       SalesCustomersModule,
   'sales-direct':          DirectSalesModule,
+  'sales-report':          SalesReportModule,
 
   'proc-dashboard':        ProcurementDashboardModule,
   'proc-suppliers':        SupplierMasterModule,
