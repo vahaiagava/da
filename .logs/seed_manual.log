@@ -1,0 +1,8 @@
+== /api/rahaza/setup/seed-sample 200
+== /api/rahaza/hr-seed/run 200
+== /api/seed/maklon-full 200
+== /api/marketing/seed-sample-data 200
+== /api/dewi/seed-demo-full 200
+  linked admin@garment.com -> DA-001 (f4404208-ca02-46db-8ae0-047ac5749cfa)
+DONE: 10 role accounts upserted.
+DONE (idempotent).

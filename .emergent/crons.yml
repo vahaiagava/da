@@ -1,0 +1,17 @@
+crons:
+  - name: mark-overdue
+    description: "Tandai invoice AR/AP yang lewat jatuh tempo sebagai overdue setiap hari 00:15 WIB"
+    cron: "15 0 * * *"
+    timezone: "Asia/Jakarta"
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    endpoint: "{{BASE_URL}}/api/cron/mark-overdue"
+    method: POST
+    enabled: true
+  - name: fg-valuation-check
+    description: "Cek selisih Nilai Persediaan FG vs GL 1-1404; kirim notifikasi Finance bila belum terjelaskan (07:00 WIB)"
+    cron: "0 7 * * *"
+    timezone: "Asia/Jakarta"
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    endpoint: "{{BASE_URL}}/api/cron/fg-valuation-check"
+    method: POST
+    enabled: true

@@ -1,0 +1,32 @@
+[1;36m[bootstrap][0m 1/6 Menyiapkan backend/.env
+[1;32m  ✓ generate JWT_SECRET[0m
+[1;32m  ✓ set EMERGENT_LLM_KEY (dari argumen)[0m
+[1;32m  ✓ frontend/.env REACT_APP_BACKEND_URL ada[0m
+[1;32m  ✓ set GENERATE_SOURCEMAP=false[0m
+[1;32m  ✓ set DISABLE_ESLINT_PLUGIN=true[0m
+[1;36m[bootstrap][0m 1b/6 Resolusi lint root repo
+    ✓ resolusi root: eslint-formatter-unix -> /usr/lib/node_modules/eslint-formatter-unix
+    → repo memuat app Expo/React Native; memasang eslint-config-expo (global)…
+    ✓ eslint-config-expo terpasang
+  
+  [1m==================================================================[0m
+    [96mINV-LINT-01[0m — Gate lint platform bisa jalan & lulus (oxlint + import validation)
+  [1m==================================================================[0m
+  
+  [1m------------------------------------------------------------------[0m
+    INV-LINT-01: 6 diperiksa — 0 temuan
+    [92m[1m✓ INV-LINT-01 HIJAU — 0 pelanggaran blok (WARN/MED/LOW = laporan saja).[0m
+  
+    ✓ mesin lint PLATFORM jalan untuk semua framework yang terdeteksi
+[1;36m[bootstrap][0m 1c/6 Sanity: mongod hidup + deps backend benar-benar terpasang
+[1;32m  ✓ mongodb RUNNING[0m
+    v pid=280 nofile 1024 -> 200000 (target 200000)
+[1;33m  ! deps backend belum lengkap → marker cache dibuang, pip install dipaksa[0m
+[1;33m  ! deps frontend belum lengkap (15 paket hilang: @simplewebauthn/browser @tanstack/react-virtual @tiptap/extension-image @tiptap/extension-underline @tiptap/pm @tiptap/react @tiptap/starter-kit cross-env html2canvas html5-qrcode jspdf jspdf-autotable react-beautiful-dnd react-data-grid xlsx) → marker cache dibuang, yarn install dipaksa[0m
+[1;36m[bootstrap][0m 2/6 Install deps (backend+frontend PARALEL, cache by-hash)
+[1;36m[bootstrap][0m   → pip install jalan di background (PID 1441)
+[1;36m[bootstrap][0m   → yarn install jalan di background (PID 1447)
+[1;32m  ✓ pip install selesai[0m
+[1;32m  ✓ yarn install selesai[0m
+[1;36m[bootstrap][0m 2b/6 Frontend static bundle (stable-mode)
+[1;36m[bootstrap][0m   → yarn build (nice -n 19; beberapa menit di 1 core, heap 1024MB)
